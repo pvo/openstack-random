@@ -1,0 +1,403 @@
+#!/usr/bin/env python
+
+# We want to generate a pseudo-random stream of commands to the API. By
+# this we mean it generates real commands with the required (or optional)
+# attributes, but a mix of real and random values. So we can do something
+# useful, we'll eventually move along the standard state transition
+# (confirm resize or revert resize will almost always follow a resize
+# eventually) but there will likely be other commands in between. There
+# is the rare case we'll just "give up" and delete everything.
+
+# We also want to end up in a predetermined end state. In our case, we
+# want to end up with an instance that is deleted.
+
+import os
+import random
+import sys
+import threading
+import time
+
+import novaclient.exceptions
+import novaclient.v1_1.client
+
+#os.environ['NOVA_RAX_AUTH'] = '1'
+
+max_servers = 1
+
+users = {
+    'admin': {'key': 'admin', 'tenant': 'openstack'},
+}
+
+#auth_url = 'https://identity.api.rackspacecloud.com/v2.0/'
+#auth_data = {
+#    'region_name': 'DFW',
+#    'service_name': 'cloudServers',
+#}
+
+auth_url = 'http://127.0.0.1:8774/'
+auth_data = {}
+
+
+def weighted_sample(items, n):
+    "Roulette wheel selection"
+    results = []
+    total = float(sum(w for w, v in items))
+    i = 0
+    w, v = items[0]
+    for n in xrange(n or 1, 0, -1):
+        x = total * (1 - random.random() ** (1.0 / n))
+        total -= x
+        while x > w:
+            x -= w
+            i += 1
+            w, v = items[i]
+        w -= x
+        results.append(v)
+
+    return results
+
+class Instance(object):
+    current_operation = None
+
+    def __init__(self, server):
+        self.server = server	# novaclient server object
+        self.current_state = server.status
+        self.plan = []
+
+
+class Tenant(object):
+    def __init__(self, name):
+        self.name = name
+        self.creds = users[name]
+
+        self.client = novaclient.v1_1.client.Client(
+                self.name,
+                self.creds['key'],
+                self.creds['tenant'],
+                auth_url,
+                **auth_data)
+
+        self.flavors = self.client.flavors.list()
+        self.flavors.sort(lambda a, b: cmp(a.ram, b.ram))
+
+        self.images = self.client.images.list()
+
+        self.instances_by_serverid = {}
+        self.instances_by_shortid = {}
+
+    def add_instance(self, instance):
+        self.instances_by_serverid[instance.server.id] = instance
+
+        shortid = instance.server.id[:4]
+        while shortid in self.instances_by_shortid:
+            shortid = instance.server.id[:len(shortid) + 1]
+
+        instance.id = shortid
+
+        self.instances_by_shortid[shortid] = instance
+
+
+names = ['homer', 'marge', 'bart', 'lisa', 'maggie', 'patty', 'selma',
+         'milhouse', 'wendell',  'lewis', 'janey', 'martin', 'sherri',
+         'terri', 'ralph', 'nelson', 'lenny', 'carl', 'itchy', 'scratchy',
+         'duffman', 'ned', 'rod', 'todd', 'barney', 'kearney', 'krusty',
+         'waylon', 'moe', 'willie']
+
+
+class Operation(object):
+    expected = 'state:ACTIVE'
+
+    def __init__(self, tenant, instance=None):
+        self.tenant = tenant
+        self.instance = instance
+
+    def setup(self):
+        pass
+
+    def update(self, result):
+        if self.expected != result:
+            return 'fail', self.expected
+
+        return 'next', None
+
+    def __str__(self):
+        return self.__class__.__name__
+
+
+all_operations = []
+
+
+class Create(Operation):
+    next_ops = all_operations
+
+    def setup(self):
+        # Randomly pick a name
+        self.name = random.sample(names, 1)[0]
+        # Randomly pick an image
+        self.image = random.sample(self.tenant.images, 1)[0]
+        # Randomly pick a flavor
+        self.flavor = random.sample(self.tenant.flavors, 1)[0]
+
+    def execute(self):
+        print 'Creating server %s (image %s, flavor %sMB)' % (self.name,
+                self.image.name, self.flavor.ram)
+        server = self.tenant.client.servers.create(image=self.image.id,
+                                                   flavor=self.flavor.id,
+                                                   name=self.name)
+
+        self.instance = Instance(server)
+        self.instance.current_operation = self
+        self.tenant.add_instance(self.instance)
+
+        print '%s: created server %s' % (self.instance.id,
+                                         self.instance.server.id)
+
+    def __str__(self):
+        return 'Create name=%r, image=%r, flavor=%dMB' % (self.name,
+                self.image.id, self.flavor.ram)
+
+
+class SetPassword(Operation):
+    def setup(self):
+        self.password = 'foobar'
+
+    def execute(self):
+        self.expected = 'state:ACTIVE'
+        print '%s: set password to %s' % (self.instance.id, self.password)
+        self.tenant.client.servers.change_password(self.instance.server.id,
+                                                   self.password)
+
+    def update(self, result):
+        if result == 'state:PASSWORD':
+           return 'wait', None
+
+        return super(SetPassword, self).update(result)
+
+    def __str__(self):
+        return 'SetPassword password=%r' % self.password
+
+
+class Resize(Operation):
+    def setup(self):
+        self.flavor = random.sample(self.tenant.flavors, 1)[0]
+
+    def execute(self):
+        if self.instance.server.status != 'ACTIVE':
+            # Invalid state
+            self.expected = 'error:409'
+        elif self.flavor.id == self.instance.server.flavor['id']:
+            # No change in size
+            self.expected = 'error:400'
+        else:
+            self.expected = 'state:VERIFY_RESIZE'
+
+        print '%s: resize to %dMB' % (self.instance.id, self.flavor.ram)
+        self.tenant.client.servers.resize(self.instance.server.id,
+                                          self.flavor.id)
+
+    def update(self, result):
+        if result == 'state:RESIZE':
+           return 'wait', None
+
+        return super(Resize, self).update(result)
+
+    def __str__(self):
+        return 'Resize flavor=%dMB' % self.flavor.ram
+
+
+class ConfirmResize(Operation):
+    def execute(self):
+        if self.instance.server.status != 'VERIFY_RESIZE':
+            self.expected = 'error:409'
+
+        print '%s: confirm resize' % self.instance.id
+        self.tenant.client.servers.confirm_resize(self.instance.server.id)
+
+
+class RevertResize(Operation):
+    def execute(self):
+        if self.instance.server.status != 'VERIFY_RESIZE':
+            self.expected = 'error:409'
+
+        print '%s: revert resize' % self.instance.id
+        self.tenant.client.servers.revert_resize(self.instance.server.id)
+
+    def update(self, result):
+        if result == 'state:REVERT_RESIZE':
+           return 'wait', None
+
+        return super(RevertResize, self).update(result)
+
+
+class Rescue(Operation):
+    def execute(self):
+        if self.instance.server.status != 'ACTIVE':
+            # Invalid state
+            self.expected = 'error:409'
+        else:
+            self.expected = 'state:RESCUE'
+
+        print '%s: rescue' % self.instance.id
+        self.tenant.client.servers.rescue(self.instance.server.id)
+
+
+class Unrescue(Operation):
+    def execute(self):
+        if self.instance.server.status != 'RESCUE':
+            # Invalid state
+            self.expected = 'error:409'
+        else:
+            self.expected = 'state:ACTIVE'
+
+        print '%s: unrescue' % self.instance.id
+        self.tenant.client.servers.unrescue(self.instance.server.id)
+
+
+class Delete(Operation):
+    def execute(self):
+        print '%s: deleting' % self.instance.id
+        self.tenant.client.servers.delete(self.instance.server.id)
+
+    def update(self, result):
+        # Deleting from states will move back to ACTIVE while it's being
+        # deleted
+        if result in ('state:ACTIVE', 'state:DELETED'):
+           return 'wait', None
+
+        return super(Delete, self).update(result)
+
+
+operations = [
+    (1, SetPassword),
+    (1, Resize),
+    (1, ConfirmResize),
+    (1, RevertResize),
+    (1, Rescue),
+    (1, Unrescue),
+    (1, Delete),
+]
+
+
+def tenant_loop(name):
+    # FIXME: Implement personalities? (Blend of images, blend of flavors,
+    # auto-disk config, gives up easily, etc)
+
+    tenant = Tenant(name)
+
+    for server in tenant.client.servers.list():
+        print '%s %-14s %s' % (server.id, server.status, server.name)
+
+        instance = Instance(server)
+
+        # Each step specifies an expected state, so if we have instances
+        # that already exist and are in an operation, let's start them
+        # out by waiting until they finish operation.
+        if instance.current_state == 'BUILD':
+            instance.current_operation = Create(tenant, instance)
+        elif instance.current_state == 'RESIZE':
+            instance.current_operation = Resize(tenant, instance)
+        elif instance.current_state == 'RESCUE':
+            instance.current_operation = Rescue(tenant, instance)
+
+        tenant.add_instance(instance)
+
+    while True:
+        if not tenant.instances_by_serverid:
+            # We can't do anything useful without any instances
+            op = Create(tenant)
+            op.setup()
+            op.execute()
+
+        # Check if any instances have changed state
+        workdone = False
+        serverids = set(tenant.instances_by_serverid.keys())
+        for server in tenant.client.servers.list():
+            instance = tenant.instances_by_serverid.get(server.id)
+            if not instance:
+                # Someone deleting an instance between list() and get()?
+                continue
+
+            serverids.remove(server.id)
+
+            if instance.server.status != server.status:
+                # Callback to operation for it to determine if this
+                # is expected or not
+                if instance.current_operation:
+                    op = instance.current_operation
+                    action, expected = op.update('state:%s' % server.status)
+                    if action == 'fail':
+                        print '%s: UNEXPECTED state change from %s to %s,' \
+                              ' expecting %s' % (instance.id,
+                                                 instance.server.status,
+                                                 server.status,
+                                                 expected)
+                        sys.exit(1)
+                    elif action in ('wait', 'next'):
+                        print '%s: state change from %s to %s' % \
+                                (instance.id, instance.server.status,
+                                 server.status)
+                        if action == 'next':
+                            instance.current_operation = None
+                    else:
+                        print '%s: UNKNOWN action %r' % (instance.id, action)
+                        raise ValueError('Unknown state change action %r' %
+                                         action)
+                else:
+                    print '%s: state change from %s to %s' % (instance.id,
+                          instance.server.status, server.status)
+
+
+            instance.server = server
+            instance.current_state = server.status
+
+            if not instance.current_operation:
+                # Pick a new operation and do it
+                op = weighted_sample(operations, 1)[0](tenant, instance)
+                op.setup()
+                try:
+                    op.execute()
+                    instance.current_operation = op
+                except novaclient.exceptions.ClientException as exc:
+                    action, expected = op.update('error:%d' % exc.code)
+                    if action == 'fail':
+                        print '%s: UNEXPECTED error %d, expecting %s' % \
+                                (instance.id, exc.code, expected)
+                        sys.exit(1)
+                    elif action == 'next':
+                        print '%s: received expected error %d' % \
+                                (instance.id, exc.code)
+                    else:
+                        print '%s: UNKNOWN action %r' % (instance.id, action)
+                        raise ValueError('Unknown error action %r' % action)
+
+                workdone = True
+
+        for serverid in serverids:
+            instance = tenant.instances_by_serverid[serverid]
+            del tenant.instances_by_serverid[serverid]
+            del tenant.instances_by_shortid[instance.id]
+            print '%s: no longer exists' % instance.id
+
+        if not workdone:
+            time.sleep(5)
+
+def tenant_thread(tenant):
+    try:
+        tenant_loop(tenant)
+    finally:
+        tenants.append(tenant)
+        thread_event.set()
+
+# FIXME: Hack until the rest of the script is working and we want to
+# use multiple threads for multiple users
+tenant_loop('admin')
+
+# Randomly start new tenants. Both starting new work and restarting tenant
+# threads that randomly decided to finish and kill everything off.
+tenants = []
+while True:
+    thread = threading.Thread(target=tenant_thread, name=tenant, args=(tenant,))
+    thread.start()
+
+    # FIXME: Random delay, only if we don't have enough tenants
+    thread_event.wait(10)
